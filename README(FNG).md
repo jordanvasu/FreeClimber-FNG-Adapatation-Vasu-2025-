@@ -10,7 +10,7 @@ This repository contains modifications to the [FreeClimber](https://github.com/a
 - Jordan Vasu (2024)  
 - Added functions for:
   - FNG detection (climb → fall events)
-  - Fall distance measurement
+  - Fall distance measurement -> This function takes the difference between a fall initiating and stopping. In this way, it can be considered the time between a _Drosophila_ falling and recovering from the fall.
   
 
 ## License
