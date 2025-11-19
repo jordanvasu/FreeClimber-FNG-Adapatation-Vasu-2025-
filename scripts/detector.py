@@ -888,6 +888,223 @@ class detector(object):
         elif method == 'min_err': result = result[result.err == result.err.min()]
         else: print("Unrecognized method, chose either 'max_r' to select the window with the greatest R or 'min_err' to select the window with the lowest error")
         return result
+
+        # ---------- FNG detection helpers ----------
+    def _height_traces(self):
+        """
+        Build per-vial mean y-position vs frame from self.df_filtered.
+        Returns a DataFrame indexed by frame with one column per vial.
+        """
+        df = getattr(self, 'df_filtered', None)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        H = (df.groupby(['frame','vial']).y.mean()
+               .unstack('vial')
+               .sort_index())
+        return H  # rows=frame, cols=vial (1..self.vials)
+
+    def _detect_fng_series(self, series,
+                           smooth_window=None,
+                           climb_thresh=None,
+                           fall_thresh=None,
+                           min_gap=None):
+        """
+        Detect 'climb–then–fall' events in one vial's height trace.
+
+        All thresholds operate on 0–1 normalized signal.
+        Returns a list of dicts with:
+          - frame_peak        : video frame index at peak height
+          - frame_fall_start  : frame where fall is considered to start (peak)
+          - frame_fall_end    : frame of post-peak minimum within the window
+          - rise_norm         : normalized rise magnitude
+          - drop_norm         : normalized drop magnitude
+          - drop_px           : fall distance in pixels (peak - post-peak minimum)
+          - drop_cm           : fall distance in cm (if pixel_to_cm is defined)
+        """
+        # EXTREMELY PERMISSIVE DEFAULTS FOR DEBUGGING
+        smooth_window = smooth_window if smooth_window is not None else 1
+        climb_thresh  = climb_thresh  if climb_thresh  is not None else 0.0
+        fall_thresh   = fall_thresh   if fall_thresh   is not None else 0.0
+        min_gap       = min_gap       if min_gap       is not None else 1
+
+        # Smooth and keep length (centered rolling) in original units (pixels)
+        s = pd.Series(series).rolling(window=max(1, int(smooth_window)),
+                                      center=True).mean().bfill().ffill()
+
+        # Normalize 0..1 so thresholds are comparable across rigs
+        rng = (s.max() - s.min())
+        if not pd.notnull(rng) or rng == 0:
+          return []
+        n = (s - s.min()) / rng
+        nv = n.values
+
+
+
+        # Keep track of original frame indices for reporting
+        frame_index = s.index.to_numpy()
+
+        # Candidate peaks (tops of climbs)
+        peaks, _ = find_peaks(nv)
+
+        events = []
+        last_event_frame = -10**9
+        w = max(1, int(smooth_window)) * 2
+
+        # Pixel→cm conversion (if available)
+        px_to_cm = getattr(self, 'pixel_to_cm', None)
+        if px_to_cm is not None:
+            try:
+                px_to_cm = float(px_to_cm)
+                if px_to_cm <= 0:
+                    px_to_cm = None
+            except Exception:
+                px_to_cm = None
+
+        for p in peaks:
+            # Enforce minimum gap between events (in frames)
+            if p - last_event_frame < min_gap:
+                continue
+
+            # Left/right windows in normalized space (indices are positional)
+            left_start = max(0, p - w)
+            left_end   = p + 1
+            right_start = p
+            right_end   = min(len(nv), p + w)
+
+            left = nv[left_start:left_end]
+            right = nv[right_start:right_end]
+
+            if len(left) < 2 or len(right) < 2:
+                continue
+
+            left_min  = left.min()
+            right_min = right.min()
+
+            # Position of the post-peak minimum within the right window
+            right_rel_idx = right.argmin()
+            right_idx = right_start + right_rel_idx  # positional index into s / nv
+
+            rise = nv[p] - left_min
+            drop_norm = nv[p] - right_min
+
+            # Require sufficient rise and drop in normalized units
+            if rise >= climb_thresh and drop_norm >= fall_thresh:
+                # True heights (pixels) at peak and post-peak minimum
+                peak_height_px = float(s.iloc[p])
+                bottom_height_px = float(s.iloc[right_idx])
+                drop_px = peak_height_px - bottom_height_px  # positive if falling down
+
+                # Convert to cm if calibration is available
+                if px_to_cm is not None:
+                    drop_cm = drop_px / px_to_cm
+                else:
+                    drop_cm = np.nan
+
+                events.append({
+                    'frame_peak'       : int(frame_index[p]),        # actual frame number
+                    'frame_fall_start' : int(frame_index[p]),        # define start at peak
+                    'frame_fall_end'   : int(frame_index[right_idx]),
+                    'rise_norm'        : float(rise),
+                    'drop_norm'        : float(drop_norm),
+                    'drop_px'          : float(drop_px),
+                    'drop_cm'          : float(drop_cm),
+                })
+                last_event_frame = p
+
+        return events
+
+    def compute_fng(self):
+        """
+        Compute FNG events per vial from df_filtered and save:
+          - self.df_fng: event-level table (one row per detected FNG event)
+          - self.df_fng_counts: counts per vial
+
+        Writes <video>.fng.csv alongside the other outputs.
+
+        Columns in self.df_fng:
+          - vial
+          - event_idx
+          - frame_peak
+          - frame_fall_start
+          - frame_fall_end
+          - rise_norm
+          - drop_norm
+          - drop_px
+          - drop_cm
+        """
+        if not getattr(self, 'fng_enabled', True):
+            self.df_fng = pd.DataFrame()
+            self.df_fng_counts = pd.DataFrame({
+                'vial': range(1, getattr(self, 'vials', 0) + 1),
+                'fng_count': 0
+            })
+            return
+
+        H = self._height_traces()
+        path_fng = self.name_nosuffix + '.fng.csv'
+
+        if H.empty:
+            self.df_fng = pd.DataFrame(columns=[
+                'vial','event_idx',
+                'frame_peak','frame_fall_start','frame_fall_end',
+                'rise_norm','drop_norm','drop_px','drop_cm'
+            ])
+            self.df_fng_counts = pd.DataFrame({
+                'vial': range(1, getattr(self, 'vials', 0) + 1),
+                'fng_count': 0
+            })
+            # still emit a headered csv for consistency
+            self.df_fng.to_csv(path_fng, index=False)
+            print('                --> Saved:', path_fng.split('/')[-1])
+            return
+
+        records = []
+        for vial in H.columns:
+            series = H[vial]
+            evs = self._detect_fng_series(
+                series,
+                smooth_window=getattr(self, 'fng_smooth_window', 5),
+                climb_thresh=getattr(self, 'fng_climb_thresh', 0.10),
+                fall_thresh=getattr(self, 'fng_fall_thresh', 0.10),
+                min_gap=getattr(self, 'fng_min_gap', 5),
+            )
+            for idx, ev in enumerate(evs, start=1):
+                records.append({
+                    'vial'            : int(vial),
+                    'event_idx'       : idx,
+                    'frame_peak'      : int(ev['frame_peak']),
+                    'frame_fall_start': int(ev['frame_fall_start']),
+                    'frame_fall_end'  : int(ev['frame_fall_end']),
+                    'rise_norm'       : round(ev['rise_norm'], 4),
+                    'drop_norm'       : round(ev['drop_norm'], 4),
+                    'drop_px'         : round(ev['drop_px'], 4),
+                    'drop_cm'         : round(ev['drop_cm'], 4),
+                })
+
+        self.df_fng = pd.DataFrame.from_records(
+            records,
+            columns=[
+                'vial','event_idx',
+                'frame_peak','frame_fall_start','frame_fall_end',
+                'rise_norm','drop_norm','drop_px','drop_cm'
+            ]
+        )
+
+        counts = (self.df_fng.groupby('vial').size()
+                    .rename('fng_count')
+                    .reindex(range(1, self.vials + 1), fill_value=0)
+                    .reset_index())
+        self.df_fng_counts = counts
+
+        # Save per-event csv
+        if self.df_fng.empty:
+            # write header only for consistency
+            self.df_fng.to_csv(path_fng, index=False)
+        else:
+            self.df_fng.to_csv(path_fng, index=False)
+        print('                --> Saved:', path_fng.split('/')[-1])
+
+
         
         
     def step_1(self, gui = False, grayscale = True):
@@ -1076,6 +1293,9 @@ class detector(object):
         
         ## Convert vial assignments from float to int
         self.df_filtered['vial'] = self.df_filtered['vial'].astype('int')
+
+        #----FNG detection (per vial) ----
+        self.compute_fng()
 
         ## Save the filtered DataFrame
         path_filtered = self.name_nosuffix+'.filtered.csv'
